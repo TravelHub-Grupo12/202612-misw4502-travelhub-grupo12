@@ -278,42 +278,29 @@ class TestPublishReservaRechazada:
 # ===========================================================================
 
 class TestConsumerCallback:
-    def test_approves_when_random_below_threshold(self):
+    def test_acks_valid_command(self):
         from modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer import callback
         ch, method, props = _make_callback_mocks()
         body = json.dumps({"commandType": "SolicitarAprobacionManualCmd", "id_reserva": "r-1"}).encode()
 
-        with patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.random.random",
-            return_value=0.5,
-        ), patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.publish_reserva_aprobada"
-        ) as mock_aprobada, patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.publish_reserva_rechazada"
-        ) as mock_rechazada:
-            callback(ch, method, props, body)
+        callback(ch, method, props, body)
 
-        mock_aprobada.assert_called_once_with("r-1")
-        mock_rechazada.assert_not_called()
         ch.basic_ack.assert_called_once_with(delivery_tag=method.delivery_tag)
 
-    def test_rejects_when_random_above_threshold(self):
+    def test_does_not_auto_publish(self):
         from modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer import callback
         ch, method, props = _make_callback_mocks()
         body = json.dumps({"commandType": "SolicitarAprobacionManualCmd", "id_reserva": "r-2"}).encode()
 
         with patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.random.random",
-            return_value=0.9,
-        ), patch(
             "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.publish_reserva_aprobada"
         ) as mock_aprobada, patch(
             "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.publish_reserva_rechazada"
         ) as mock_rechazada:
             callback(ch, method, props, body)
 
-        mock_rechazada.assert_called_once_with("r-2", "El cliente está reportado negativamente")
         mock_aprobada.assert_not_called()
+        mock_rechazada.assert_not_called()
         ch.basic_ack.assert_called_once_with(delivery_tag=method.delivery_tag)
 
     def test_uses_type_key_when_commandType_absent(self):
@@ -321,49 +308,31 @@ class TestConsumerCallback:
         ch, method, props = _make_callback_mocks()
         body = json.dumps({"type": "SolicitarAprobacionManual", "id_reserva": "r-3"}).encode()
 
-        with patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.random.random",
-            return_value=0.1,
-        ), patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.publish_reserva_aprobada"
-        ) as mock_aprobada:
-            callback(ch, method, props, body)
+        callback(ch, method, props, body)
 
-        mock_aprobada.assert_called_once_with("r-3")
+        ch.basic_ack.assert_called_once_with(delivery_tag=method.delivery_tag)
 
     def test_falls_back_to_reservaId_key(self):
         from modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer import callback
         ch, method, props = _make_callback_mocks()
         body = json.dumps({"commandType": "Cmd", "reservaId": "r-fallback"}).encode()
 
-        with patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.random.random",
-            return_value=0.1,
-        ), patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.publish_reserva_aprobada"
-        ) as mock_aprobada:
-            callback(ch, method, props, body)
+        callback(ch, method, props, body)
 
-        mock_aprobada.assert_called_once_with("r-fallback")
+        ch.basic_ack.assert_called_once_with(delivery_tag=method.delivery_tag)
 
     def test_invalid_json_is_caught(self):
         from modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer import callback
         ch, method, props = _make_callback_mocks()
         callback(ch, method, props, b"not-json")  # must not raise
 
-    def test_exception_during_publish_is_caught(self):
+    def test_exception_during_ack_is_caught(self):
         from modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer import callback
         ch, method, props = _make_callback_mocks()
         body = json.dumps({"commandType": "Cmd", "id_reserva": "r-5"}).encode()
+        ch.basic_ack.side_effect = RuntimeError("ack error")
 
-        with patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.random.random",
-            return_value=0.1,
-        ), patch(
-            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.publish_reserva_aprobada",
-            side_effect=RuntimeError("publish error"),
-        ):
-            callback(ch, method, props, body)  # must not raise
+        callback(ch, method, props, body)  # must not raise
 
     def test_exception_prints_error_message(self, capsys):
         from modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer import callback
@@ -557,4 +526,100 @@ class TestStartConsumer:
         mock_cc.side_effect = self._raise_after(1)
         with pytest.raises(KeyboardInterrupt):
             start_consumer()
+
+
+# ===========================================================================
+# modules/partner/infrastructure/api.py
+# ===========================================================================
+
+class TestApiEndpoints:
+    def _client(self):
+        with patch(
+            "modules.partner.infrastructure.consumers.solicitar_aprobacion_consumer.start_consumer"
+        ):
+            from config.app import create_app
+            app = create_app()
+        return TestClient(app)
+
+    # --- aprobar ---
+
+    @patch("modules.partner.infrastructure.api.publish_reserva_aprobada")
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_aprobar_reserva_pendiente_returns_200(self, mock_get, mock_pub):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"estado": "PENDIENTE"})
+        mock_pub.return_value = None
+        resp = self._client().post("/partner/reserva/res-1/aprobar", json={"id_usuario_admin": "admin-1"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["id_reserva"] == "res-1"
+        assert body["id_usuario_admin"] == "admin-1"
+        mock_pub.assert_called_once()
+
+    @patch("modules.partner.infrastructure.api.publish_reserva_aprobada")
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_aprobar_reserva_hold_returns_200(self, mock_get, mock_pub):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"estado": "HOLD"})
+        mock_pub.return_value = None
+        resp = self._client().post("/partner/reserva/res-2/aprobar", json={"id_usuario_admin": "admin-2"})
+        assert resp.status_code == 200
+
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_aprobar_reserva_confirmada_returns_409(self, mock_get):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"estado": "CONFIRMADA"})
+        resp = self._client().post("/partner/reserva/res-3/aprobar", json={"id_usuario_admin": "admin-1"})
+        assert resp.status_code == 409
+
+    @patch("modules.partner.infrastructure.api.publish_reserva_aprobada")
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_aprobar_reserva_publish_fails_returns_503(self, mock_get, mock_pub):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"estado": "PENDIENTE"})
+        mock_pub.side_effect = RuntimeError("rabbit down")
+        resp = self._client().post("/partner/reserva/res-4/aprobar", json={"id_usuario_admin": "admin-1"})
+        assert resp.status_code == 503
+
+    @patch("modules.partner.infrastructure.api.publish_reserva_aprobada")
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_aprobar_booking_unavailable_still_publishes(self, mock_get, mock_pub):
+        mock_get.side_effect = Exception("booking unavailable")
+        mock_pub.return_value = None
+        resp = self._client().post("/partner/reserva/res-5/aprobar", json={"id_usuario_admin": "admin-1"})
+        assert resp.status_code == 200
+        mock_pub.assert_called_once()
+
+    # --- rechazar ---
+
+    @patch("modules.partner.infrastructure.api.publish_reserva_rechazada")
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_rechazar_reserva_pendiente_returns_200(self, mock_get, mock_pub):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"estado": "PENDIENTE"})
+        mock_pub.return_value = None
+        resp = self._client().post("/partner/reserva/res-6/rechazar", json={"motivo": "fraude", "id_usuario_admin": "admin-1"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["id_reserva"] == "res-6"
+        assert body["motivo"] == "fraude"
+        mock_pub.assert_called_once()
+
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_rechazar_reserva_confirmada_returns_409(self, mock_get):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"estado": "CONFIRMADA"})
+        resp = self._client().post("/partner/reserva/res-7/rechazar", json={"motivo": "fraude", "id_usuario_admin": "admin-1"})
+        assert resp.status_code == 409
+
+    @patch("modules.partner.infrastructure.api.publish_reserva_rechazada")
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_rechazar_reserva_publish_fails_returns_503(self, mock_get, mock_pub):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"estado": "HOLD"})
+        mock_pub.side_effect = RuntimeError("rabbit down")
+        resp = self._client().post("/partner/reserva/res-8/rechazar", json={"motivo": "fraude", "id_usuario_admin": "admin-1"})
+        assert resp.status_code == 503
+
+    @patch("modules.partner.infrastructure.api.publish_reserva_rechazada")
+    @patch("modules.partner.infrastructure.api.httpx.get")
+    def test_rechazar_booking_unavailable_still_publishes(self, mock_get, mock_pub):
+        mock_get.side_effect = Exception("booking unavailable")
+        mock_pub.return_value = None
+        resp = self._client().post("/partner/reserva/res-9/rechazar", json={"motivo": "fraude", "id_usuario_admin": "admin-1"})
+        assert resp.status_code == 200
+        mock_pub.assert_called_once()
 
