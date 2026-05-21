@@ -1,5 +1,4 @@
 import json
-import random
 import time
 from config.rabbitmq import create_connection
 from modules.partner.infrastructure.publishers.aprobacion_publisher import (
@@ -34,12 +33,7 @@ def callback(ch, method, properties, body):
 
         print(f"Recibido Comando {command_type} vía {ROUTING_KEY} para la reserva: {id_reserva}")
 
-        if random.random() < 0.8:
-            print(f"Aprobando manualmente la reserva {id_reserva}")
-            publish_reserva_aprobada(id_reserva)
-        else:
-            print(f"Rechazando manualmente la reserva {id_reserva} por reporte negativo")
-            publish_reserva_rechazada(id_reserva, "El cliente está reportado negativamente")
+        print(f"Reserva {id_reserva} en espera de aprobación manual del partner.")
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
     except Exception as e:
